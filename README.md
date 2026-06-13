@@ -267,8 +267,7 @@ echo "Using GAIE release: ${IGW_RELEASE}"
 
 ---
 
-## Step 3: Install the CRDs
-
+## Step 3: Install t
 Gateway API CRDs (the base), then the Inference Extension CRDs:
 
 ```bash
