@@ -24,6 +24,13 @@ a 128k context window are not the same thing), model servers accumulate state (K
 and multi-tenant platforms need a way to express which workloads have priority when GPU
 capacity is contended.
 
+That accumulated state is the crux. The **KV cache** is the per-request computation a model
+server has already done for the tokens it has seen; reusing it is what makes generation fast.
+So routing a request to a pod that already holds the relevant prefix in cache avoids
+recomputing it, while a round-robin load balancer, blind to that state, would scatter related
+requests and throw the cache away. Inference routing is different precisely because the best
+backend depends on what each server has already computed, not just on how busy it is.
+
 The [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/)
 (GAIE) is the Kubernetes SIG-network answer to this problem. It extends the standard Gateway
 API with three new primitives:
@@ -121,7 +128,7 @@ graph TB
 | **Gateway** | The actual L7 entry point, with an external IP. Clients send requests here. |
 | **HTTPRoute** | Routing rule that matches `/v1/completions` and forwards traffic to an InferencePool (not a plain Service). |
 | **InferencePool** | GAIE custom resource that groups model server pods and exposes them as a single routing target. The EPP is attached to it. |
-| **Endpoint Picker (EPP)** | The brain of GAIE. A sidecar-style component that intercepts each request and selects the best pod based on load, queue depth, and InferenceObjective priority. |
+| **Endpoint Picker (EPP)** | The brain of GAIE. A separate deployment the Gateway calls out to (via Envoy ext-proc) on every request; it returns the pod to route to, chosen from load, queue depth, KV cache, and InferenceObjective priority. |
 | **InferenceObjective** | Declares request priority for a given workload. Which tenant or use-case wins when capacity is contended, expressed as an auditable Kubernetes object. |
 | **vLLM simulator** | A drop-in fake vLLM server. Returns simulated output without loading a model or requiring a GPU. Used here to validate the routing path on a laptop. |
 
@@ -129,6 +136,29 @@ The key difference from a standard Kubernetes ingress setup: the HTTPRoute backe
 **InferencePool**, not a plain Service. That one level of indirection is what lets the
 Endpoint Picker make a per-request routing decision (load, priority, capacity) instead of
 round-robin.
+
+---
+
+## How the Endpoint Picker actually decides
+
+The diagrams show the request passing through the EPP, but the *mechanism* is the part worth
+naming, because it's what makes GAIE different from a plain load balancer.
+
+The EPP is not a sidecar injected into your model pods, and the Gateway does not route to it.
+It's a **separate deployment** (the `vllm-sim-epp-...` pod from Step 7) that the Gateway
+**calls out to** over gRPC, using **Envoy's external processing (ext-proc)** protocol. The
+flow for every single request is:
+
+1. The request hits the Gateway.
+2. Before routing, the Gateway makes an ext-proc gRPC call to the EPP, handing it the request.
+3. The EPP evaluates real-time signals (queue depth, active requests, KV cache, and the
+   InferenceObjective priority) and **returns the exact endpoint** to use.
+4. The Gateway forwards the request to that endpoint.
+
+This is why the EPP can swap implementations the same way the GatewayClass can: any gateway
+that speaks ext-proc and Gateway API can host it. And it's exactly what the response header
+proves in Step 11: `x-inference-pod` names the pod the EPP picked, so you can point at the
+decision instead of taking it on faith.
 
 ---
 
